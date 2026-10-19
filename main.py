@@ -1,6 +1,8 @@
 import os
 import re
 import sys
+import time
+from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from curl_cffi import requests
@@ -8,20 +10,31 @@ from curl_cffi import requests
 MARKET_URL = "https://metaforge.app/wardogs/market"
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
+# 1차: 직접 접속 시 사용할 브라우저 프로필 목록
+BROWSER_PROFILES = ["chrome", "safari", "chrome124", "edge101"]
 
-def fetch_market_data() -> dict:
-    """MetaForge 워독스 금괴 마켓 페이지에서 시세 데이터를 추출합니다."""
-    response = requests.get(
-        MARKET_URL,
-        impersonate="chrome120",
-        timeout=30,
-        headers={
-            "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
-        },
-    )
-    response.raise_for_status()
+# 2차: GitHub 데이터센터 IP가 Cloudflare 403에 막혔을 때 사용할 우회 경로 목록
+FALLBACK_URLS = [
+    ("Jina Reader 우회", f"https://r.jina.ai/{MARKET_URL}"),
+    ("CodeTabs 프록시 우회", f"https://api.codetabs.com/v1/proxy?quest={MARKET_URL}"),
+    ("AllOrigins 프록시 우회", f"https://api.allorigins.win/raw?url={quote(MARKET_URL, safe='')}"),
+]
 
-    soup = BeautifulSoup(response.text, "html.parser")
+BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+    "Referer": "https://www.google.com/",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def extract_metrics_from_raw(raw_content: str) -> dict:
+    """HTML 또는 텍스트 응답에서 금괴 시세와 변동률을 추출합니다."""
+    soup = BeautifulSoup(raw_content, "html.parser")
     full_text = " ".join(soup.get_text(separator=" ").split())
 
     data = {
@@ -32,7 +45,6 @@ def fetch_market_data() -> dict:
         "vs_avg_30d": "-",
     }
 
-    # 1차 추출: 텍스트 패턴 매칭 (CSS 클래스가 바뀌어도 안정적으로 동작)
     patterns = {
         "current": r"Current\s*\$?\s*([0-9,]+)",
         "change_7d": r"7\s*days\s*([+-]?[0-9.]+%)",
@@ -47,7 +59,6 @@ def fetch_market_data() -> dict:
             val = match.group(1).strip()
             data[key] = f"${val}" if key == "current" and not val.startswith("$") else val
 
-    # 2차 보완 추출: tabular-nums 클래스를 가진 span 태그 순서 기반
     if data["current"] == "확인 불가":
         spans = [
             s.get_text(strip=True)
@@ -64,6 +75,53 @@ def fetch_market_data() -> dict:
     return data
 
 
+def fetch_market_data() -> dict:
+    """여러 브라우저 프로필과 3중 우회 프록시를 순차 시도해 시세 데이터를 가져옵니다."""
+    last_error = None
+
+    # 1단계: 직접 접속 시도
+    for idx, profile in enumerate(BROWSER_PROFILES, start=1):
+        try:
+            print(f"[직접 접속 {idx}/{len(BROWSER_PROFILES)}] {profile} 프로필 시도 중...")
+            session = requests.Session(impersonate=profile)
+            res = session.get(MARKET_URL, headers=BROWSER_HEADERS, timeout=25)
+            if res.status_code == 200:
+                parsed = extract_metrics_from_raw(res.text)
+                if parsed["current"] != "확인 불가":
+                    print(f"[성공] {profile} 직접 접속으로 시세 확인: {parsed['current']}")
+                    return parsed
+            print(f"[안내] {profile} 응답 코드: {res.status_code}")
+            last_error = f"HTTP {res.status_code}"
+        except Exception as exc:
+            print(f"[안내] {profile} 접속 예외: {exc}")
+            last_error = str(exc)
+        time.sleep(2)
+
+    # 2단계: 우회 경로 순차 시도 (GitHub IP가 Cloudflare 403에 차단된 경우)
+    for name, url in FALLBACK_URLS:
+        try:
+            print(f"[우회 접속] {name} 경로로 시세 조회 시도 중...")
+            res = requests.get(
+                url,
+                impersonate="chrome",
+                headers={"Accept": "text/html,text/plain,*/*"},
+                timeout=35,
+            )
+            if res.status_code == 200:
+                parsed = extract_metrics_from_raw(res.text)
+                if parsed["current"] != "확인 불가":
+                    print(f"[성공] {name} 경로로 시세 확인 완료: {parsed['current']}")
+                    return parsed
+            print(f"[안내] {name} 응답 코드: {res.status_code}")
+            last_error = f"{name} HTTP {res.status_code}"
+        except Exception as exc:
+            print(f"[안내] {name} 접속 예외: {exc}")
+            last_error = str(exc)
+        time.sleep(2)
+
+    raise RuntimeError(f"모든 접속 및 우회 경로가 실패했습니다 (마지막 오류: {last_error})")
+
+
 def send_discord_webhook(data: dict) -> None:
     """추출한 금괴 시세를 디스코드 웹후크 Embed 메시지로 전송합니다."""
     if not WEBHOOK_URL:
@@ -72,7 +130,6 @@ def send_discord_webhook(data: dict) -> None:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.now(kst).strftime("%Y-%m-%d %H:%M KST")
 
-    # 30일 평균 대비 낮으면 매수 유리(초록색), 높으면 주의(주황색) 색상 표시
     embed_color = 0x10B981 if data["vs_avg_30d"].startswith("-") else 0xF59E0B
 
     payload = {
