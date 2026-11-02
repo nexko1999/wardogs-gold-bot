@@ -20,7 +20,7 @@ jobs:
 
     steps:
     - name: 저장소 코드 불러오기
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Python 3.11 설치
       uses: actions/setup-python@v5
