@@ -16,9 +16,18 @@ BROWSER_PROFILES = ["chrome", "safari", "chrome124", "edge101"]
 # 2차: GitHub 데이터센터 IP가 Cloudflare 403에 막혔을 때 사용할 우회 경로 목록
 FALLBACK_URLS = [
     ("Jina Reader 우회", f"https://r.jina.ai/{MARKET_URL}"),
-    ("CodeTabs 프록시 우회", f"https://api.codetabs.com/v1/proxy?quest={MARKET_URL}"),
+    ("CodeTabs 프록시 우회", f"https://api.codetabs.com/v1/proxy?quest={quote(MARKET_URL, safe='')}"),
     ("AllOrigins 프록시 우회", f"https://api.allorigins.win/raw?url={quote(MARKET_URL, safe='')}"),
 ]
+
+# 우회 경로 요청 헤더: 프록시가 캐시해 둔 오래된 페이지 대신 최신 페이지를 받도록 요청
+# (X-No-Cache 는 Jina Reader 전용 헤더, 다른 프록시에는 영향 없음)
+FALLBACK_HEADERS = {
+    "Accept": "text/html,text/plain,*/*",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "X-No-Cache": "true",
+}
 
 BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -32,94 +41,206 @@ BROWSER_HEADERS = {
 }
 
 
+MISSING_PRICE = "확인 불가"
+
+# 현재가 형식: 숫자(천 단위 쉼표, 소수점 허용). 단위는 인게임 Cash 이므로 통화 기호는 저장하지 않음
+PRICE_RE = re.compile(r"[0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?")
+# 퍼센트 형식: 선택적 부호 + 숫자 + %
+PERCENT_RE = re.compile(r"[+-]?[0-9][0-9,]*(?:\.[0-9]+)?%")
+# 마크다운 이미지 태그: ![alt](url)
+MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+
+
+def normalize_minus(text: str) -> str:
+    """유니코드 마이너스(U+2212)와 en dash(U+2013)를 ASCII '-'로 정규화합니다."""
+    return text.replace("\u2212", "-").replace("\u2013", "-")
+
+
+def is_valid_price(value: str) -> bool:
+    """현재가 문자열이 숫자 형식(예: 396,210)인지 검사합니다."""
+    return bool(PRICE_RE.fullmatch(value.strip()))
+
+
 def extract_metrics_from_raw(raw_content: str) -> dict:
     """HTML 또는 텍스트 응답에서 금괴 시세와 변동률을 추출합니다."""
     soup = BeautifulSoup(raw_content, "html.parser")
-    full_text = " ".join(soup.get_text(separator=" ").split())
+    full_text = normalize_minus(" ".join(soup.get_text(separator=" ").split()))
+    # Jina Reader 마크다운 응답은 "Current![Image](...)![Image](...) 396,210"처럼
+    # 라벨과 숫자 사이에 이미지 태그가 끼므로 먼저 제거
+    full_text = MD_IMAGE_RE.sub(" ", full_text)
 
     data = {
-        "current": "확인 불가",
+        "current": MISSING_PRICE,
         "change_7d": "-",
         "change_30d": "-",
         "change_all": "-",
         "vs_avg_30d": "-",
     }
 
+    # PERCENT_RE 와 같은 형식으로 통일
+    pct = r"([+-]?[0-9][0-9,]*(?:\.[0-9]+)?%)"
     patterns = {
-        "current": r"Current\s*\$?\s*([0-9,]+)",
-        "change_7d": r"7\s*days\s*([+-]?[0-9.]+%)",
-        "change_30d": r"30\s*days\s*([+-]?[0-9.]+%)",
-        "change_all": r"All\s*time\s*([+-]?[0-9.]+%)",
-        "vs_avg_30d": r"vs\s*30-day\s*average\s*([+-]?[0-9.]+%)",
+        "current": r"Current\s*\$?\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)",
+        # (?<![0-9.]) : "17 days", "130 days", "1.7 days" 같은 오매칭 방지
+        "change_7d": r"(?<![0-9.])7\s*days?\s*" + pct,
+        "change_30d": r"(?<![0-9.])30[\s-]*days?\s*" + pct,
+        "change_all": r"All\s*time\s*" + pct,
+        "vs_avg_30d": r"vs\s*30[\s-]*days?\s*average\s*" + pct,
     }
 
     for key, pattern in patterns.items():
         match = re.search(pattern, full_text, re.IGNORECASE)
         if match:
             val = match.group(1).strip()
-            data[key] = f"${val}" if key == "current" and not val.startswith("$") else val
+            data[key] = val
 
-    if data["current"] == "확인 불가":
+    if data["current"] == MISSING_PRICE:
         spans = [
-            s.get_text(strip=True)
+            normalize_minus(s.get_text(strip=True))
             for s in soup.select("span.tabular-nums")
             if s.get_text(strip=True)
         ]
-        if len(spans) >= 5:
-            data["current"] = spans[0]
-            data["change_7d"] = spans[1]
-            data["change_30d"] = spans[2]
-            data["change_all"] = spans[3]
-            data["vs_avg_30d"] = spans[4]
+        # 실제 페이지는 첫 span이 "Steam online: 90,251" 같은 다른 지표이므로,
+        # "가격 1개 + 퍼센트 4개"가 연속으로 나오는 위치를 찾아서만 채택
+        for i in range(len(spans) - 4):
+            price, pcts = spans[i], spans[i + 1 : i + 5]
+            price = price.lstrip("$").strip()  # 텍스트에 $ 가 붙어 와도 숫자만 남김
+            if is_valid_price(price) and all(PERCENT_RE.fullmatch(p) for p in pcts):
+                data["current"] = price
+                data["change_7d"], data["change_30d"], data["change_all"], data["vs_avg_30d"] = pcts
+                break
 
     return data
 
 
 def fetch_market_data() -> dict:
     """여러 브라우저 프로필과 3중 우회 프록시를 순차 시도해 시세 데이터를 가져옵니다."""
-    last_error = None
+    errors: list[str] = []  # "경로: 오류" 목록
 
     # 1단계: 직접 접속 시도
     for idx, profile in enumerate(BROWSER_PROFILES, start=1):
         try:
             print(f"[직접 접속 {idx}/{len(BROWSER_PROFILES)}] {profile} 프로필 시도 중...")
-            session = requests.Session(impersonate=profile)
-            res = session.get(MARKET_URL, headers=BROWSER_HEADERS, timeout=25)
+            with requests.Session(impersonate=profile) as session:
+                res = session.get(MARKET_URL, headers=BROWSER_HEADERS, timeout=25)
             if res.status_code == 200:
                 parsed = extract_metrics_from_raw(res.text)
-                if parsed["current"] != "확인 불가":
-                    print(f"[성공] {profile} 직접 접속으로 시세 확인: {parsed['current']}")
+                if is_valid_price(parsed["current"]):
+                    print(f"[성공] {profile} 직접 접속으로 시세 확인: {parsed['current']} Cash")
+                    parsed["source"] = f"직접 접속({profile})"
                     return parsed
-            print(f"[안내] {profile} 응답 코드: {res.status_code}")
-            last_error = f"HTTP {res.status_code}"
+                print(f"[안내] {profile} HTTP 200이지만 시세 파싱 실패")
+                errors.append(f"직접 접속({profile}): HTTP 200이지만 시세 파싱 실패")
+            else:
+                print(f"[안내] {profile} 응답 코드: {res.status_code}")
+                errors.append(f"직접 접속({profile}): HTTP {res.status_code}")
         except Exception as exc:
             print(f"[안내] {profile} 접속 예외: {exc}")
-            last_error = str(exc)
-        time.sleep(2)
+            errors.append(f"직접 접속({profile}): {exc}")
+        if idx < len(BROWSER_PROFILES):
+            time.sleep(2)
 
     # 2단계: 우회 경로 순차 시도 (GitHub IP가 Cloudflare 403에 차단된 경우)
-    for name, url in FALLBACK_URLS:
+    for idx, (name, url) in enumerate(FALLBACK_URLS, start=1):
         try:
             print(f"[우회 접속] {name} 경로로 시세 조회 시도 중...")
             res = requests.get(
                 url,
                 impersonate="chrome",
-                headers={"Accept": "text/html,text/plain,*/*"},
+                headers=FALLBACK_HEADERS,
                 timeout=35,
             )
             if res.status_code == 200:
                 parsed = extract_metrics_from_raw(res.text)
-                if parsed["current"] != "확인 불가":
-                    print(f"[성공] {name} 경로로 시세 확인 완료: {parsed['current']}")
+                if is_valid_price(parsed["current"]):
+                    print(f"[성공] {name} 경로로 시세 확인 완료: {parsed['current']} Cash")
+                    parsed["source"] = name
                     return parsed
-            print(f"[안내] {name} 응답 코드: {res.status_code}")
-            last_error = f"{name} HTTP {res.status_code}"
+                print(f"[안내] {name} HTTP 200이지만 시세 파싱 실패")
+                errors.append(f"{name}: HTTP 200이지만 시세 파싱 실패")
+            else:
+                print(f"[안내] {name} 응답 코드: {res.status_code}")
+                errors.append(f"{name}: HTTP {res.status_code}")
         except Exception as exc:
             print(f"[안내] {name} 접속 예외: {exc}")
-            last_error = str(exc)
-        time.sleep(2)
+            errors.append(f"{name}: {exc}")
+        if idx < len(FALLBACK_URLS):
+            time.sleep(2)
 
-    raise RuntimeError(f"모든 접속 및 우회 경로가 실패했습니다 (마지막 오류: {last_error})")
+    detail = "\n".join(errors)
+    raise RuntimeError(f"모든 접속 및 우회 경로가 실패했습니다\n{detail}")
+
+
+def pick_embed_color(vs_avg_30d: str) -> int:
+    """30일 평균 대비 값으로 임베드 색을 정합니다. 음수=초록, 양수/0=주황, 파싱 불가=회색."""
+    text = normalize_minus(vs_avg_30d).strip()
+    if not PERCENT_RE.fullmatch(text):
+        return 0x6B7280
+    value = float(text.rstrip("%").replace(",", ""))
+    return 0x10B981 if value < 0 else 0xF59E0B
+
+
+def post_webhook(payload: dict, max_attempts: int = 3) -> None:
+    """웹후크로 전송합니다. 429(retry_after 준수, 상한 30초)·5xx·네트워크 예외는 재시도합니다."""
+    for attempt in range(1, max_attempts + 1):
+        is_last = attempt == max_attempts
+        try:
+            res = requests.post(WEBHOOK_URL, json=payload, timeout=15)
+        except Exception as exc:
+            if is_last:
+                raise
+            print(f"[안내] 디스코드 전송 예외, 재시도 ({attempt}/{max_attempts}): {mask_secret(str(exc))}")
+            time.sleep(2)
+            continue
+        if not is_last:
+            if res.status_code == 429:
+                try:
+                    wait = float(res.json().get("retry_after", 1))
+                except Exception:
+                    wait = 1.0
+                wait = min(max(wait, 0.0), 30.0)
+                print(f"[안내] 디스코드 429 응답, {wait:.1f}초 후 재시도 ({attempt}/{max_attempts})")
+                time.sleep(wait)
+                continue
+            if 500 <= res.status_code < 600:
+                print(f"[안내] 디스코드 {res.status_code} 응답, 재시도 ({attempt}/{max_attempts})")
+                time.sleep(2)
+                continue
+        res.raise_for_status()
+        return
+
+
+def mask_secret(text: str) -> str:
+    """문자열에 웹후크 URL이 포함되어 있으면 마스킹합니다."""
+    if WEBHOOK_URL:
+        text = text.replace(WEBHOOK_URL, "***")
+    return text
+
+
+def send_failure_notice(error: Exception) -> None:
+    """수집 실패 알림을 디스코드로 보냅니다(best-effort, 전송 예외는 삼킴)."""
+    try:
+        summary = mask_secret(str(error))[:1000] or error.__class__.__name__
+        description = f"시세 수집에 실패했습니다.\n```\n{summary}\n```"
+        server = os.environ.get("GITHUB_SERVER_URL")
+        repo = os.environ.get("GITHUB_REPOSITORY")
+        run_id = os.environ.get("GITHUB_RUN_ID")
+        if server and repo and run_id:
+            description += f"\n[Actions 실행 로그]({server}/{repo}/actions/runs/{run_id})"
+        payload = {
+            "username": "워독스 금괴 시세 알림봇",
+            "embeds": [
+                {
+                    "title": "⚠️ WARDOGS 금괴 시세 수집 실패",
+                    "description": description,
+                    "color": 0xEF4444,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+        }
+        post_webhook(payload)
+    except Exception as exc:
+        print(f"[안내] 실패 알림 전송 실패: {mask_secret(str(exc))}", file=sys.stderr)
 
 
 def send_discord_webhook(data: dict) -> None:
@@ -130,7 +251,8 @@ def send_discord_webhook(data: dict) -> None:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.now(kst).strftime("%Y-%m-%d %H:%M KST")
 
-    embed_color = 0x10B981 if data["vs_avg_30d"].startswith("-") else 0xF59E0B
+    embed_color = pick_embed_color(data["vs_avg_30d"])
+    source = data.get("source", "알 수 없음")
 
     payload = {
         "username": "워독스 금괴 시세 알림봇",
@@ -139,14 +261,15 @@ def send_discord_webhook(data: dict) -> None:
                 "title": "🪙 WARDOGS 일일 금괴(Gold Bar) 시세 리포트",
                 "url": MARKET_URL,
                 "description": (
-                    f"현재 인게임 금괴 1개당 교환 시세는 **{data['current']}** 입니다.\n"
+                    f"현재 인게임 금괴 1개당 교환 시세는 **{data['current']} Cash** 입니다.\n"
                     f"데이터 출처: [MetaForge Wardogs Gold Bar Market]({MARKET_URL})"
                 ),
                 "color": embed_color,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "fields": [
                     {
                         "name": "💰 현재 시세 (Cash / Bar)",
-                        "value": f"**{data['current']}**",
+                        "value": f"**{data['current']} Cash**",
                         "inline": False,
                     },
                     {
@@ -171,22 +294,32 @@ def send_discord_webhook(data: dict) -> None:
                     },
                 ],
                 "footer": {
-                    "text": f"기준 시각: {now_kst} • Source: metaforge.app/wardogs/market"
+                    "text": f"기준 시각: {now_kst} • 수집 경로: {source} • Source: metaforge.app/wardogs/market"
                 },
             }
         ],
     }
 
-    res = requests.post(WEBHOOK_URL, json=payload, timeout=15)
-    res.raise_for_status()
-    print(f"[성공] 디스코드 웹후크 전송 완료: {data['current']}")
+    post_webhook(payload)
+    print(f"[성공] 디스코드 웹후크 전송 완료: {data['current']} Cash")
 
 
 if __name__ == "__main__":
+    # 웹후크 URL 검증은 수집 이전에 먼저 수행
+    if not WEBHOOK_URL:
+        print("[오류 발생] DISCORD_WEBHOOK_URL 환경변수가 설정되지 않았습니다.", file=sys.stderr)
+        sys.exit(1)
+
     try:
         market_info = fetch_market_data()
+    except Exception as exc:
+        print(f"[오류 발생] {mask_secret(str(exc))}", file=sys.stderr)
+        send_failure_notice(exc)
+        sys.exit(1)
+
+    try:
         print("추출된 시세 데이터:", market_info)
         send_discord_webhook(market_info)
     except Exception as exc:
-        print(f"[오류 발생] {exc}", file=sys.stderr)
+        print(f"[오류 발생] {mask_secret(str(exc))}", file=sys.stderr)
         sys.exit(1)
