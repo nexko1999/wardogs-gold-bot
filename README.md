@@ -41,7 +41,10 @@ python main.py
 
 ## 테스트
 
-네트워크 없이 파싱 로직만 검증하는 단위 테스트(`tests/test_parse.py`)가 있습니다.
+네트워크 없이 실행되는 단위 테스트가 두 개 있습니다.
+
+- `tests/test_parse.py`: 시세 파싱 로직
+- `tests/test_webhook.py`: 웹후크 전송 재시도(429·503·네트워크 오류), 실패 알림, 웹후크 URL 가림 처리, 수집 경로별 오류 집계
 
 ```bash
 pip install -r requirements.txt
