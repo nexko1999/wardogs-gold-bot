@@ -1,14 +1,23 @@
 name: Daily Wardogs Gold Price Webhook
+# 실행 기록 제목. '오늘 이미 보냈는지' 판단에 이 제목을 쓰므로 바꾸면 아래 TITLE 도 함께 바꿀 것
+run-name: ${{ inputs.dry_run && '금괴 시세 확인 모드(전송 없음)' || '금괴 시세 일일 전송' }}
 
+# 주 실행: 외부 예약 서비스(cron-job.org)가 KST 10:00, 10:30 에 workflow_dispatch API 로 실행시킨다.
+# 아래 schedule 은 비상용. GitHub 예약은 지연이 커서(보통 KST 오후 4~6시경) 정시 보장이 안 된다.
+# 어느 경로로 실행되든 '오늘(KST) 이미 전송 성공'이면 전송을 건너뛰므로 중복 알림은 없다.
 on:
   schedule:
-    # 설정은 UTC 01:07 = KST 10:07 (정각 병목 우회). 단, GitHub 예약 실행 지연(원인 추정)으로 실제 도착은
-    # 보통 UTC 07~09시대(KST 오후 4~6시경)이며 시각은 보장되지 않는다.
+    # 비상용: 설정은 UTC 01:07 = KST 10:07 이지만 GitHub 예약 실행 지연(원인 추정)으로
+    # 실제 시작은 보통 UTC 07~09시대(KST 오후 4~6시경). 그날 이미 보냈으면 건너뛴다.
     - cron: '7 1 * * *'
   workflow_dispatch: # GitHub Actions 탭에서 'Run workflow' 버튼으로 수동 즉시 실행 가능
     inputs:
       dry_run:
         description: '확인 모드: 체크하면 디스코드로 보내지 않고 수집 결과만 로그에 출력'
+        type: boolean
+        default: false
+      force:
+        description: '강제 전송: 체크하면 오늘 이미 보냈어도 다시 전송'
         type: boolean
         default: false
 
@@ -23,21 +32,54 @@ jobs:
   send-gold-price:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read   # 오늘 실행 기록 조회용
 
     steps:
+    - name: 오늘(KST) 이미 전송했는지 확인
+      id: guard
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        RUN_ID: ${{ github.run_id }}
+        TITLE: 금괴 시세 일일 전송
+        DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        FORCE: ${{ inputs.force && 'true' || 'false' }}
+      run: |
+        # KST 오늘 0시를 UTC 로 변환
+        START=$(date -u -d "$(TZ=Asia/Seoul date +%Y-%m-%d) 00:00 +0900" +%Y-%m-%dT%H:%M:%SZ)
+        # 조회 실패 시에는 전송을 진행한다(누락보다 중복이 낫다)
+        if COUNT=$(gh api "repos/$REPO/actions/workflows/daily.yml/runs?created=%3E%3D$START&status=success&per_page=100"             | jq --arg t "$TITLE" --argjson me "$RUN_ID" '[.workflow_runs[] | select(.display_title == $t and .id != $me)] | length'); then
+          echo "오늘(KST, $START 이후) 전송 성공 기록: ${COUNT}건"
+        else
+          echo "::warning::실행 기록 조회 실패 → 중복 가능성을 감수하고 전송 진행"
+          COUNT=0
+        fi
+        if [ "$DRY_RUN" = "true" ] || [ "$FORCE" = "true" ] || [ "$COUNT" = "0" ]; then
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "[건너뜀] 오늘 이미 전송했으므로 이번 실행은 보내지 않습니다."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: 저장소 코드 불러오기
+      if: steps.guard.outputs.skip != 'true'
       uses: actions/checkout@v7
 
     - name: Python 3.11 설치
+      if: steps.guard.outputs.skip != 'true'
       uses: actions/setup-python@v7
       with:
         python-version: '3.11'
         cache: pip
 
     - name: 필요한 라이브러리 설치 (Cloudflare 우회 및 HTML 파싱)
+      if: steps.guard.outputs.skip != 'true'
       run: pip install -r requirements.txt
 
     - name: 워독스 금괴 시세 수집 및 디스코드 웹후크 전송 실행
+      if: steps.guard.outputs.skip != 'true'
       env:
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         # 예약 실행에는 inputs 가 없어 DRY_RUN 은 'false' → 항상 일반 전송

@@ -23,7 +23,11 @@ metaforge.app 의 Wardogs 금괴(Gold Bar) 시장 시세를 매일 스크래핑�
 
 ## 스케줄
 
-- 설정은 매일 **KST 10:07** (UTC 01:07) 입니다. (`.github/workflows/daily.yml` 의 cron `7 1 * * *`)
+- **주 실행: 외부 예약 서비스 cron-job.org** 가 매일 **KST 10:00, 10:30** 에 GitHub API(`workflow_dispatch`)로 워크플로를 실행시킵니다. 10:00 에 보내고, 10:30 은 10:00 이 실패했을 때만 다시 보내는 재시도용입니다.
+  - 호출: `POST https://api.github.com/repos/nexko1999/wardogs-gold-bot/actions/workflows/daily.yml/dispatches`, 본문 `{"ref":"main"}`, 헤더 `Authorization: Bearer <토큰>`·`Accept: application/vnd.github+json`·`X-GitHub-Api-Version: 2022-11-28`. 정상 응답은 204.
+  - 토큰은 이 저장소 하나에 `Actions: Read and write` 권한만 준 fine-grained 토큰이며 cron-job.org 에만 저장합니다. **만료되면 알림이 멈추므로 만료 전에 새로 발급해 교체**해야 합니다.
+- **중복 방지:** 실행할 때마다 먼저 "오늘(KST) 이미 전송 성공한 실행(제목 `금괴 시세 일일 전송`)"이 있는지 확인하고, 있으면 전송을 건너뜁니다. 조회 자체가 실패하면 누락보다 중복이 낫다는 원칙으로 전송합니다. 수동 실행의 **강제 전송** 체크는 이 확인을 무시합니다.
+- **비상용: GitHub 자체 예약**(cron `7 1 * * *`, 설정상 KST 10:07)도 남겨 두었습니다. 그날 이미 보냈으면 건너뛰고, 외부 예약이 모두 실패한 날에만 늦게라도 보냅니다.
 - 다만 GitHub 예약 실행 지연(원인 추정)으로 **실제 도착은 보통 UTC 07~09시대(KST 오후 4~6시경)** 이며, 시각은 보장되지 않습니다. (최근 기록: 11-04 07:27Z, 11-03 07:49Z, 11-02 07:36Z, 10-31 09:03Z, 10-30 09:15Z, 10-26 08:15Z)
 - 정각 시각의 실행 지연을 피하려고 일부러 7분을 어긋나게 두었습니다.
 
@@ -50,7 +54,7 @@ python main.py --dry-run
 
 `DISCORD_WEBHOOK_URL` 없이도 실행되며, 실제 수집·파싱을 한 뒤 디스코드로 보낼 Embed payload(JSON)를 콘솔에 출력만 합니다. 웹후크 전송과 실패 알림 전송은 하지 않습니다. 수집 성공 시 종료 코드 0, 실패 시 1 입니다.
 
-PC 없이 GitHub 서버에서 확인하려면: Actions 탭 → `Daily Wardogs Gold Price Webhook` → `Run workflow` → **확인 모드** 체크 → 실행. 디스코드로는 보내지 않고, 실행 로그의 "수집 및 디스코드 웹후크 전송" 단계에 결과가 출력됩니다. 예약 실행(매일 자동)은 항상 일반 전송입니다.
+PC 없이 GitHub 서버에서 확인하려면: Actions 탭 → `Daily Wardogs Gold Price Webhook` → `Run workflow` → **확인 모드** 체크 → 실행. 디스코드로는 보내지 않고, 실행 로그의 "수집 및 디스코드 웹후크 전송" 단계에 결과가 출력됩니다. 매일 자동 실행은 항상 일반 전송입니다. 이미 보낸 날 다시 보내려면 **강제 전송**을 체크하세요.
 
 ## 테스트
 
