@@ -1,7 +1,7 @@
 # 2026-11-02 검증: Linux/Python 3.11 휠 설치 가능 확인 + 실제 사이트 응답 파싱 확인 (업그레이드 시 CI·수동 실행으로 재검증)
 curl_cffi==0.17.0
 beautifulsoup4==4.15.0
-soupsieve==2.10
+soupsieve==3.0.4
 cffi==2.1.1
 pycparser==3.12
 certifi==2026.10.23
