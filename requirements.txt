@@ -1,4 +1,4 @@
-# 2026-11-02 검증: Linux/Python 3.11 휠 설치 가능 확인 + 실제 사이트 응답 파싱 확인 (업그레이드 시 CI·수동 실행으로 재검증)
+# 2026-11-05: soupsieve 3.0.4 반영, CI 통과·GitHub 확인 모드(dry_run)로 실사이트 파싱 확인 (업그레이드 시 같은 방법으로 재검증)
 curl_cffi==0.17.0
 beautifulsoup4==4.15.0
 soupsieve==3.0.4

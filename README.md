@@ -7,6 +7,8 @@ metaforge.app 의 Wardogs 금괴(Gold Bar) 시장 시세를 매일 스크래핑�
 1. **직접 접속**: `curl_cffi` 로 여러 브라우저 프로필(chrome, safari, chrome124, edge101)을 흉내 내어 `https://metaforge.app/wardogs/market` 에 접속합니다.
 2. **우회 프록시**: 직접 접속이 모두 실패하면(예: GitHub 데이터센터 IP 의 Cloudflare 403) Jina Reader, CodeTabs, AllOrigins 를 차례로 시도합니다. 2026-11-02 점검 시 CodeTabs/AllOrigins 두 서비스 모두 오류 응답(522/500)이 관찰되었습니다. 우회 요청에는 캐시 방지 헤더(`Cache-Control: no-cache`, Jina 전용 `X-No-Cache: true`)를 붙여 프록시에 캐시된 오래된 페이지 대신 최신 페이지를 받도록 합니다.
 3. 응답에서 현재 시세, 7일/30일/전체 기간 변동률, 30일 평균 대비 값을 추출해 디스코드 Embed 로 전송합니다. 푸터에 수집 경로(직접 접속 또는 어떤 우회 경로인지)가 표시됩니다.
+   - 현재가와 변동률 4개가 모두 있는 **완전한 결과**를 준 경로를 우선 채택하고, 일부 변동률이 빠진 불완전한 결과면 다음 경로를 계속 시도합니다.
+   - 끝까지 완전한 결과가 없으면 현재가가 유효했던 가장 먼저 얻은 결과로 알림을 보냅니다. 이때 Actions 로그에 `::warning::` 경고로 누락 항목을 남기고, Embed 푸터에 "일부 변동률 확인 불가: ..." 를 표시합니다(종료 코드는 0).
 4. 모든 경로가 실패하면 경로별 오류를 모아 디스코드에 실패 알림(빨간색 Embed, Actions 실행 링크 포함)을 보내고 종료 코드 1 로 끝납니다.
 
 ### 시세 단위
@@ -21,8 +23,9 @@ metaforge.app 의 Wardogs 금괴(Gold Bar) 시장 시세를 매일 스크래핑�
 
 ## 스케줄
 
-- 매일 **KST 10:07** (UTC 01:07) 에 자동 실행됩니다. (`.github/workflows/daily.yml` 의 cron `7 1 * * *`)
-- 정각 시각의 실행 지연을 피하려고 일부러 7분을 어긋나게 두었습니다. GitHub 예약 실행은 몇 분 지연될 수 있습니다.
+- 설정은 매일 **KST 10:07** (UTC 01:07) 입니다. (`.github/workflows/daily.yml` 의 cron `7 1 * * *`)
+- 다만 GitHub 예약 실행 지연(원인 추정)으로 **실제 도착은 보통 UTC 07~09시대(KST 오후 4~6시경)** 이며, 시각은 보장되지 않습니다. (최근 기록: 11-04 07:27Z, 11-03 07:49Z, 11-02 07:36Z, 10-31 09:03Z, 10-30 09:15Z, 10-26 08:15Z)
+- 정각 시각의 실행 지연을 피하려고 일부러 7분을 어긋나게 두었습니다.
 
 ## 수동 실행
 
@@ -39,12 +42,23 @@ export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."   # Windows Po
 python main.py
 ```
 
+### 확인 모드 (디스코드로 보내지 않고 확인)
+
+```bash
+python main.py --dry-run
+```
+
+`DISCORD_WEBHOOK_URL` 없이도 실행되며, 실제 수집·파싱을 한 뒤 디스코드로 보낼 Embed payload(JSON)를 콘솔에 출력만 합니다. 웹후크 전송과 실패 알림 전송은 하지 않습니다. 수집 성공 시 종료 코드 0, 실패 시 1 입니다.
+
+PC 없이 GitHub 서버에서 확인하려면: Actions 탭 → `Daily Wardogs Gold Price Webhook` → `Run workflow` → **확인 모드** 체크 → 실행. 디스코드로는 보내지 않고, 실행 로그의 "수집 및 디스코드 웹후크 전송" 단계에 결과가 출력됩니다. 예약 실행(매일 자동)은 항상 일반 전송입니다.
+
 ## 테스트
 
-네트워크 없이 실행되는 단위 테스트가 두 개 있습니다.
+네트워크 없이 실행되는 단위 테스트가 세 개 있습니다.
 
 - `tests/test_parse.py`: 시세 파싱 로직
 - `tests/test_webhook.py`: 웹후크 전송 재시도(429·503·네트워크 오류), 실패 알림, 웹후크 URL 가림 처리, 수집 경로별 오류 집계
+- `tests/test_main.py`: 종료 코드, `--dry-run`, 부분 누락 처리, 우회 경로 성공, 비-429 4xx 즉시 실패, 429 마지막 시도 실패
 
 ```bash
 pip install -r requirements.txt

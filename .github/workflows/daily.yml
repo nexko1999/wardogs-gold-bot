@@ -2,9 +2,15 @@ name: Daily Wardogs Gold Price Webhook
 
 on:
   schedule:
-    # UTC 01:07 = 한국 시간(KST) 매일 오전 10시 07분 자동 실행 (정각 병목 우회)
+    # 설정은 UTC 01:07 = KST 10:07 (정각 병목 우회). 단, GitHub 예약 실행 지연(원인 추정)으로 실제 도착은
+    # 보통 UTC 07~09시대(KST 오후 4~6시경)이며 시각은 보장되지 않는다.
     - cron: '7 1 * * *'
-  workflow_dispatch: # GitHub Actions 탭에서 'Run workflow' 버튼으로 수동 즉시 테스트 가능
+  workflow_dispatch: # GitHub Actions 탭에서 'Run workflow' 버튼으로 수동 즉시 실행 가능
+    inputs:
+      dry_run:
+        description: '확인 모드: 체크하면 디스코드로 보내지 않고 수집 결과만 로그에 출력'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,7 +40,14 @@ jobs:
     - name: 워독스 금괴 시세 수집 및 디스코드 웹후크 전송 실행
       env:
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      run: python main.py
+        # 예약 실행에는 inputs 가 없어 DRY_RUN 은 'false' → 항상 일반 전송
+        DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+      run: |
+        if [ "$DRY_RUN" = "true" ]; then
+          python main.py --dry-run
+        else
+          python main.py
+        fi
 
   # 60일 비활성화 방지용 best-effort 조치.
   # enable API 호출이 60일 비활성화 타이머를 늦춘다는 것은 공식 문서로 보장되지 않는다.

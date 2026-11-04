@@ -13,7 +13,7 @@
 
 ## 프로젝트 개요
 - `main.py`가 `https://metaforge.app/wardogs/market`에서 Wardogs 금괴 시세(인게임 Cash 단위, 달러 아님)를 수집해 디스코드 웹후크로 보낸다.
-- 실행: GitHub Actions `.github/workflows/daily.yml`, 매일 KST 10:07(cron `7 1 * * *`). 수동 실행은 Actions 탭에서 `workflow_dispatch`로 한다.
+- 실행: GitHub Actions `.github/workflows/daily.yml`, 설정은 매일 KST 10:07(cron `7 1 * * *`)이지만 GitHub 예약 실행 지연(원인 추정)으로 실제 도착은 보통 오후 4~6시경(UTC 07~09시대)이며 시각은 보장되지 않는다. 수동 실행은 Actions 탭에서 `workflow_dispatch`로 한다.
 - CI: `.github/workflows/ci.yml`이 push·PR마다 단위 테스트를 돌린다.
 - 자세한 동작(직접 접속 → 우회 프록시 순서, 실패 알림, keepalive)은 `README.md`를 본다.
 
@@ -22,7 +22,15 @@
 pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
-- `tests/test_parse.py`: 파싱, `tests/test_webhook.py`: 웹후크 전송
+- `tests/test_parse.py`: 파싱, `tests/test_webhook.py`: 웹후크 전송, `tests/test_main.py`: 종료 코드·`--dry-run`·부분 누락 처리
+
+## 확인 모드 (디스코드로 보내지 않고 확인)
+```bash
+python main.py --dry-run
+```
+- `DISCORD_WEBHOOK_URL` 없이 동작하며, 수집·파싱 후 보낼 payload(JSON)를 콘솔에 출력만 한다. 웹후크·실패 알림은 전송하지 않는다.
+- 수집 성공 종료 코드 0, 실패 1.
+- GitHub 서버에서 전송 없이 확인: `gh workflow run daily.yml -f dry_run=true` (Actions 탭의 '확인 모드' 체크와 동일). 예약 실행은 항상 일반 전송.
 
 ## 파싱 시 주의
 - 페이지의 첫 `span.tabular-nums`는 "Steam online: N"이다. 시세가 아니다.

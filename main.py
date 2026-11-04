@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 import re
 import sys
@@ -61,6 +63,20 @@ def is_valid_price(value: str) -> bool:
     return bool(PRICE_RE.fullmatch(value.strip()))
 
 
+# 변동률 항목: 키 -> 표시용 이름 (누락 안내에 사용)
+CHANGE_LABELS = {
+    "change_7d": "7일 변동률",
+    "change_30d": "30일 변동률",
+    "change_all": "전체 기간 변동률",
+    "vs_avg_30d": "30일 평균 대비",
+}
+
+
+def missing_change_labels(data: dict) -> list:
+    """값이 '-'(파싱 실패)로 남은 변동률 항목의 표시 이름 목록을 돌려줍니다."""
+    return [label for key, label in CHANGE_LABELS.items() if not PERCENT_RE.fullmatch(normalize_minus(data[key]).strip())]
+
+
 def extract_metrics_from_raw(raw_content: str) -> dict:
     """HTML 또는 텍스트 응답에서 금괴 시세와 변동률을 추출합니다."""
     soup = BeautifulSoup(raw_content, "html.parser")
@@ -114,29 +130,50 @@ def extract_metrics_from_raw(raw_content: str) -> dict:
 
 
 def fetch_market_data() -> dict:
-    """여러 브라우저 프로필과 3중 우회 프록시를 순차 시도해 시세 데이터를 가져옵니다."""
+    """여러 브라우저 프로필과 3중 우회 프록시를 순차 시도해 시세 데이터를 가져옵니다.
+
+    완전한 데이터(현재가 + 변동률 4개)를 준 첫 경로를 채택합니다.
+    끝까지 완전한 결과가 없으면 현재가가 유효했던 가장 먼저 얻은 불완전 결과를 사용합니다.
+    """
     errors: list[str] = []  # "경로: 오류" 목록
+    partial: dict | None = None  # 가장 먼저 얻은 '현재가만 유효한' 불완전 결과
+
+    def evaluate(label: str, text: str):
+        """응답을 파싱해 완전하면 결과를 반환, 불완전하면 보관하고 None 반환."""
+        nonlocal partial
+        parsed = extract_metrics_from_raw(text)
+        if not is_valid_price(parsed["current"]):
+            print(f"[안내] {label} HTTP 200이지만 시세 파싱 실패")
+            errors.append(f"{label}: HTTP 200이지만 시세 파싱 실패")
+            return None
+        parsed["source"] = label
+        parsed["missing"] = missing_change_labels(parsed)
+        if not parsed["missing"]:
+            print(f"[성공] {label}로 시세 확인: {parsed['current']} Cash")
+            return parsed
+        print(f"[안내] {label} 현재가는 확인했지만 일부 변동률 누락({', '.join(parsed['missing'])}), 다음 경로 시도")
+        errors.append(f"{label}: 일부 변동률 누락({', '.join(parsed['missing'])})")
+        if partial is None:
+            partial = parsed
+        return None
 
     # 1단계: 직접 접속 시도
     for idx, profile in enumerate(BROWSER_PROFILES, start=1):
+        label = f"직접 접속({profile})"
         try:
             print(f"[직접 접속 {idx}/{len(BROWSER_PROFILES)}] {profile} 프로필 시도 중...")
             with requests.Session(impersonate=profile) as session:
                 res = session.get(MARKET_URL, headers=BROWSER_HEADERS, timeout=25)
             if res.status_code == 200:
-                parsed = extract_metrics_from_raw(res.text)
-                if is_valid_price(parsed["current"]):
-                    print(f"[성공] {profile} 직접 접속으로 시세 확인: {parsed['current']} Cash")
-                    parsed["source"] = f"직접 접속({profile})"
-                    return parsed
-                print(f"[안내] {profile} HTTP 200이지만 시세 파싱 실패")
-                errors.append(f"직접 접속({profile}): HTTP 200이지만 시세 파싱 실패")
+                result = evaluate(label, res.text)
+                if result:
+                    return result
             else:
                 print(f"[안내] {profile} 응답 코드: {res.status_code}")
-                errors.append(f"직접 접속({profile}): HTTP {res.status_code}")
+                errors.append(f"{label}: HTTP {res.status_code}")
         except Exception as exc:
             print(f"[안내] {profile} 접속 예외: {exc}")
-            errors.append(f"직접 접속({profile}): {exc}")
+            errors.append(f"{label}: {exc}")
         if idx < len(BROWSER_PROFILES):
             time.sleep(2)
 
@@ -151,13 +188,9 @@ def fetch_market_data() -> dict:
                 timeout=35,
             )
             if res.status_code == 200:
-                parsed = extract_metrics_from_raw(res.text)
-                if is_valid_price(parsed["current"]):
-                    print(f"[성공] {name} 경로로 시세 확인 완료: {parsed['current']} Cash")
-                    parsed["source"] = name
-                    return parsed
-                print(f"[안내] {name} HTTP 200이지만 시세 파싱 실패")
-                errors.append(f"{name}: HTTP 200이지만 시세 파싱 실패")
+                result = evaluate(name, res.text)
+                if result:
+                    return result
             else:
                 print(f"[안내] {name} 응답 코드: {res.status_code}")
                 errors.append(f"{name}: HTTP {res.status_code}")
@@ -166,6 +199,11 @@ def fetch_market_data() -> dict:
             errors.append(f"{name}: {exc}")
         if idx < len(FALLBACK_URLS):
             time.sleep(2)
+
+    if partial is not None:
+        # 현재가는 있으므로 알림은 보내되, GitHub Actions 경고로 누락 항목을 남김
+        print(f"::warning::모든 경로에서 완전한 변동률을 얻지 못했습니다. 누락 항목: {', '.join(partial['missing'])} (출처: {partial['source']})")
+        return partial
 
     detail = "\n".join(errors)
     raise RuntimeError(f"모든 접속 및 우회 경로가 실패했습니다\n{detail}")
@@ -243,16 +281,17 @@ def send_failure_notice(error: Exception) -> None:
         print(f"[안내] 실패 알림 전송 실패: {mask_secret(str(exc))}", file=sys.stderr)
 
 
-def send_discord_webhook(data: dict) -> None:
-    """추출한 금괴 시세를 디스코드 웹후크 Embed 메시지로 전송합니다."""
-    if not WEBHOOK_URL:
-        raise ValueError("DISCORD_WEBHOOK_URL 환경변수가 설정되지 않았습니다.")
-
+def build_payload(data: dict) -> dict:
+    """추출한 금괴 시세로 디스코드 웹후크 Embed payload를 만듭니다(전송은 하지 않음)."""
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.now(kst).strftime("%Y-%m-%d %H:%M KST")
 
     embed_color = pick_embed_color(data["vs_avg_30d"])
     source = data.get("source", "알 수 없음")
+    footer_text = f"기준 시각: {now_kst} • 수집 경로: {source} • Source: metaforge.app/wardogs/market"
+    missing = data.get("missing") or []
+    if missing:
+        footer_text = f"일부 변동률 확인 불가: {', '.join(missing)}\n" + footer_text
 
     payload = {
         "username": "워독스 금괴 시세 알림봇",
@@ -293,33 +332,67 @@ def send_discord_webhook(data: dict) -> None:
                         "inline": True,
                     },
                 ],
-                "footer": {
-                    "text": f"기준 시각: {now_kst} • 수집 경로: {source} • Source: metaforge.app/wardogs/market"
-                },
+                "footer": {"text": footer_text},
             }
         ],
     }
 
-    post_webhook(payload)
+    return payload
+
+
+def send_discord_webhook(data: dict) -> None:
+    """추출한 금괴 시세를 디스코드 웹후크 Embed 메시지로 전송합니다."""
+    if not WEBHOOK_URL:
+        raise ValueError("DISCORD_WEBHOOK_URL 환경변수가 설정되지 않았습니다.")
+
+    post_webhook(build_payload(data))
     print(f"[성공] 디스코드 웹후크 전송 완료: {data['current']} Cash")
 
 
-if __name__ == "__main__":
-    # 웹후크 URL 검증은 수집 이전에 먼저 수행
-    if not WEBHOOK_URL:
+def main(argv=None) -> int:
+    """진입점. 성공 0, 수집 실패·전송 실패 1. --dry-run 이면 전송 없이 payload만 출력합니다."""
+    parser = argparse.ArgumentParser(
+        allow_abbrev=False,  # "--dry" 같은 약어 허용 안 함
+        description="Wardogs 금괴 시세를 수집해 디스코드 웹후크로 전송합니다.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="디스코드로 전송하지 않고 payload만 콘솔에 출력합니다.",
+    )
+    # 알 수 없는 인자(오타 등)는 argparse 가 에러 출력 후 exit 2 로 종료 (수집·전송 시도 없음)
+    dry_run = parser.parse_args(argv).dry_run
+
+    # 웹후크 URL 검증은 수집 이전에 먼저 수행 (dry-run 은 URL 불필요)
+    if not dry_run and not WEBHOOK_URL:
         print("[오류 발생] DISCORD_WEBHOOK_URL 환경변수가 설정되지 않았습니다.", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     try:
         market_info = fetch_market_data()
     except Exception as exc:
         print(f"[오류 발생] {mask_secret(str(exc))}", file=sys.stderr)
-        send_failure_notice(exc)
-        sys.exit(1)
+        if not dry_run:
+            send_failure_notice(exc)
+        return 1
 
     try:
         print("추출된 시세 데이터:", market_info)
-        send_discord_webhook(market_info)
+        if dry_run:
+            print("[확인 모드] 디스코드로 전송하지 않고 payload만 출력합니다.")
+            print(json.dumps(build_payload(market_info), ensure_ascii=False, indent=2))
+        else:
+            send_discord_webhook(market_info)
     except Exception as exc:
         print(f"[오류 발생] {mask_secret(str(exc))}", file=sys.stderr)
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    # Windows 콘솔(cp949)에서도 이모지·한글 payload 출력이 깨지지 않게 함
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    sys.exit(main())
